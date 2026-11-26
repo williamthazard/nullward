@@ -454,10 +454,9 @@ function buildWanderer() {
   const root = new THREE.Group(), body = new THREE.Group(); root.add(body); body.position.y = 0.17;
   const GI = 80, GI2 = 104, WRAP = 132, SASH = 150, HOOD = 64, VISOR = 184, BOOT = 30, R = { rim: 1 };
   const ink = (geo, v, w, opt) => inked(geo, v, w, Object.assign({ glow: 0.06, rim: 1 }, opt));
-  // the gi: a dark layered wrap, a lighter sash with a knot and short ends
+  // the gi: a plain dark wrap, a lighter sash with a knot and short ends
   const prof = [[0.0, -0.01], [0.19, -0.01], [0.205, 0.03], [0.21, 0.13], [0.19, 0.22], [0.14, 0.29], [0.07, 0.31], [0.0, 0.315]].map(([x, y]) => new THREE.Vector2(x, y));
   const torso = ink(new THREE.LatheGeometry(prof, 32), GI, W_INK, { map: knit }); body.add(torso);
-  for (const sd of [-1, 1]) { const lap = ink(new THREE.BoxGeometry(0.05, 0.25, 0.025), GI2, 0.006, { map: knit }); lap.position.set(sd * 0.045, 0.2, 0.18); lap.rotation.set(-0.36, 0, sd * 0.52); body.add(lap); }
   const sash = ink(new THREE.CylinderGeometry(0.214, 0.214, 0.06, 32, 1, true), SASH, 0.008, { map: knit, side: THREE.DoubleSide, glow: 0.12 }); sash.position.y = 0.06; body.add(sash);
   const sashKnot = ink(new THREE.SphereGeometry(0.04, 10, 8), SASH, 0.008, { map: knit, glow: 0.12 }); sashKnot.scale.set(1.3, 0.9, 0.7); sashKnot.position.set(-0.1, 0.06, 0.19); body.add(sashKnot);
   const sashEnds = [0, 1].map(k => { const e = ink(new THREE.BoxGeometry(0.045, 0.13, 0.012), SASH, 0.006, { map: knit, glow: 0.12 }); e.geometry.translate(0, -0.065, 0); e.position.set(-0.1 + k * 0.03, 0.05, 0.2); e.rotation.z = 0.15 - k * 0.3; body.add(e); return e; });
@@ -471,24 +470,21 @@ function buildWanderer() {
   // the scarf's collar: a faceted wrap of cloth at the neck (its tails are simulated cloth)
   const collar = ink(new THREE.TorusGeometry(0.13, 0.062, 5, 9), 158, W_INK * 0.8, { map: knit, flat: true, glow: 0.18 }); collar.rotation.x = Math.PI / 2 - 0.15; collar.position.set(0, 0.31, -0.01); body.add(collar);
   MODEL.collar = collar;
-  // the head: a round dark hood-helmet with panel seams and a pale faceted visor
+  // the head: a round, smooth dark hood-helmet and a pale faceted visor
   const neck = new THREE.Group(); neck.position.y = 0.31; body.add(neck);
   const headG = new THREE.Group(); headG.position.y = 0.33; neck.add(headG);
   const head = ink(new THREE.SphereGeometry(0.36, 48, 36), HOOD, W_INK, { map: knit }); head.scale.set(1.04, 1.0, 1.0); headG.add(head);
-  const seamMat = new THREE.MeshBasicMaterial({ color: grey(92) });
-  const seam1 = new THREE.Mesh(new THREE.TorusGeometry(0.364, 0.005, 4, 48, Math.PI * 1.15), seamMat); seam1.rotation.set(0, Math.PI / 2, Math.PI * 0.42); headG.add(seam1);
-  for (const sd of [-1, 1]) { const sm = new THREE.Mesh(new THREE.TorusGeometry(0.364, 0.004, 4, 32, Math.PI * 0.55), seamMat); sm.rotation.set(0, Math.PI / 2 + sd * 0.55, Math.PI * 0.5); headG.add(sm); }
-  const visorGeo = new THREE.SphereGeometry(0.372, 7, 3, Math.PI / 2 - 1.02, 2.04, 1.2, 0.62);
+  const visorGeo = new THREE.SphereGeometry(0.372, 7, 4, Math.PI / 2 - 1.02, 2.04, 1.12, 0.86);
   const visor = ink(visorGeo, VISOR, 0.01, { flat: true, glow: 0.3, rim: 0.4 }); visor.scale.set(1.04, 1, 1.0); headG.add(visor);
   MODEL.visor = visor;
   // the eyes: glowing lenses in dark sockets; their shape is rebuilt every frame from the mood
   const lensMat = new THREE.MeshBasicMaterial({ color: grey(248) }), sockMat = new THREE.MeshBasicMaterial({ color: grey(6) });
   const eyes = [-1, 1].map(sd => {
-    const g = new THREE.Group(); const ex = sd * 0.13, ey = -0.005, ez = 0.372; g.position.set(ex, ey, ez); g.lookAt(ex * 3, ey * 3, ez * 3); headG.add(g);
+    const g = new THREE.Group(); const ex = sd * 0.13, ey = 0.007, ez = 0.372; g.position.set(ex, ey, ez); g.lookAt(ex * 3, ey * 3, ez * 3); headG.add(g); // centred on the visor
     const mk = (mat, z) => { const geo = new THREE.BufferGeometry(); geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(EYE_N * 3 + 3), 3)); const idx = []; for (let i = 0; i < EYE_N; i++) idx.push(0, 1 + i, 1 + (i + 1) % EYE_N); geo.setIndex(idx); const m = new THREE.Mesh(geo, mat); m.position.z = z; g.add(m); return m; };
     const sock = mk(sockMat, 0.004), lens = mk(lensMat, 0.008);
     const e = { g, sock, lens, sd, shape: { w: 1, h: 1, top: 0.04, tilt: 0, bot: 0, botCurve: 0 } };
-    writeEye(sock, e.shape, 1.32, sd); writeEye(lens, e.shape, 1.0, sd); // a resting shape before the first frame
+    writeEye(sock, e.shape, 1.26, sd); writeEye(lens, e.shape, 1.0, sd); // a resting shape before the first frame
     return e;
   });
   // arms: dark sleeves, light wrapped forearms, dark gloves
@@ -540,7 +536,7 @@ function shapeWing(k, t, bank) {
 /** One eye's lens: an ellipse cut by a lid line above (tilted) and a lifted cheek below. */
 const EYE_N = 40;
 function writeEye(mesh, S, scale, sd) {
-  const pa = mesh.geometry.attributes.position, w = 0.075 * S.w * scale, h = 0.095 * S.h * scale;
+  const pa = mesh.geometry.attributes.position, w = 0.075 * S.w * scale, h = 0.085 * S.h * scale; // widest socket (h 1.25): 0.134, inside the visor's 0.155
   const topY = h * (1 - 2 * S.top), botY = -h * (1 - 2 * S.bot);
   pa.setXYZ(0, 0, (topY + botY + S.botCurve * 0.9 * h) / 2, 0); // the fan's centre stays inside the shape, even for the smile's crescent
   for (let i = 0; i < EYE_N; i++) {
@@ -700,7 +696,7 @@ function animateWanderer(dt, pos) {
       S[k] = spring('eye' + k + e.sd, v, 260, dt);
     });
     const blink = ANIM.blinkT < 0 ? 0.08 : 1, saved = S.h; S.h = Math.max(0.05, S.h * blink);
-    writeEye(e.sock, S, 1.32, e.sd); writeEye(e.lens, S, 1.0, e.sd); S.h = saved;
+    writeEye(e.sock, S, 1.26, e.sd); writeEye(e.lens, S, 1.0, e.sd); S.h = saved;
     e.g.position.x = e.sd * 0.13 + clamp(-L.yaw, -1, 1) * 0.008;                   // the eyes drift toward what they watch
   }
   M.root.visible = !(P.invuln > 0 && Math.floor(GAME.time * 12) % 2 === 0);
