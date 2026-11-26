@@ -1,0 +1,454 @@
+<!doctype html>
+<!-- PROTOTYPE - NOT FOR PRODUCTION -->
+<!-- Question: Does fluid, floaty-but-visceral traversal across a generated greyscale nullscape, with a blade stroke that is also a movement, make you want to reach the spire again on a new seed? -->
+<!-- Date: 2026-11-25 -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#000000">
+<title>Nullward</title>
+<style>
+  html, body { margin: 0; height: 100%; height: 100dvh; background: #000; overflow: hidden; overscroll-behavior: none; }
+  body { font-variant-numeric: tabular-nums; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent; }
+  canvas { display: block; position: fixed; left: 0; top: 0; width: 100vw; height: 100vh; height: 100dvh; touch-action: none; }
+  #world { z-index: 0; }
+  #game { z-index: 1; }
+  #safe { position: fixed; visibility: hidden; padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); }
+</style>
+</head>
+<body>
+<canvas id="world"></canvas>
+<canvas id="game"></canvas>
+<div id="safe"></div>
+<script src="vendor/three.js"></script>
+<script src="config.js"></script>
+<script src="js/util.js"></script>
+<script src="js/world.js"></script>
+<script src="js/player.js"></script>
+<script src="js/critters.js"></script>
+<script src="js/render.js"></script>
+<script src="js/audio.js"></script>
+<script src="js/input.js"></script>
+<script src="js/hud.js"></script>
+<script src="js/encounters.js"></script>
+<script>
+'use strict';
+// The one-shot's starter, grown into Nullward. Kept for the checks: the fixed step, the clock
+// hook, window.game and the play and figures scenes.
+
+// ---- Built to be checked ----------------------------------------------------------------
+const params = new URLSearchParams(location.search);
+const tune = new Proxy({}, { get: (_, k) => CONFIG[k].value }); // live: tune.speed is CONFIG.speed.value
+const STEP = 1 / 60;            // simulation step in seconds; motion is per second, never per frame
+const W = 1280, H = 720;        // logical size of the HUD's short-side-720 layout
+const PIXEL = false;
+const FONT = '"Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif';
+const TITLE = 'Nullward';
+const CONTROLS = ['WASD or arrows: move', 'mouse: look (click to capture)', 'Space: jump, hold to glide', 'click or F: strike', 'Shift: slide', 'P: pause   M: mute']; // shown on the title screen
+const clock = window.GAME_CLOCK || { now: () => performance.now() / 1000 }; // a check may inject one
+const CHEAP = params.get('render') === 'cheap'; // a headless shot or check: 3D draws cheap; players never see it
+let seed;
+function rng() { // mulberry32; every gameplay random call reads this, never Math.random
+  seed = (seed + 0x6D2B79F5) | 0;
+  let t = Math.imul(seed ^ (seed >>> 15), seed | 1);
+  t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+}
+const events = []; // window.game.events: anything the game wants a run to see
+/** Record a game event: for a check to read, and for the teaching hints. */
+function emit(e) { events.push(e); if (events.length > 300) events.splice(0, events.length - 300); if (e.type && typeof GAME !== 'undefined') GAME.did[e.type] = true; if (typeof onEvent === 'function') onEvent(e); }
+
+// ---- Screen: the HUD canvas fills the window; its short side is 720 units ---------------
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+let VW = W, VH = H, HUDK = 1;
+const SAFE = { t: 0, r: 0, b: 0, l: 0 };
+function fit() {
+  const dpr = Math.min(devicePixelRatio || 1, 2), iw = innerWidth, ih = innerHeight;
+  HUDK = Math.min(iw, ih) / 720; VW = iw / HUDK; VH = ih / HUDK;
+  canvas.width = Math.round(iw * dpr); canvas.height = Math.round(ih * dpr);
+  ctx.setTransform(dpr * HUDK, 0, 0, dpr * HUDK, 0, 0);
+  const cs = getComputedStyle(document.getElementById('safe'));
+  SAFE.t = parseFloat(cs.paddingTop) / HUDK || 0; SAFE.r = parseFloat(cs.paddingRight) / HUDK || 0;
+  SAFE.b = parseFloat(cs.paddingBottom) / HUDK || 0; SAFE.l = parseFloat(cs.paddingLeft) / HUDK || 0;
+}
+addEventListener('resize', fit); fit();
+function clear() { ctx.clearRect(0, 0, VW, VH); }
+function text(s, x, y, size, c, align = 'center') {
+  ctx.fillStyle = c; ctx.font = `${size}px ${FONT}`; ctx.textAlign = align;
+  ctx.textBaseline = 'middle'; ctx.fillText(s, x, y);
+}
+
+// ---- Input: keys by position (event.code), OS key repeat ignored ------------------------
+const down = new Set(), hit = new Set();
+const pressed = code => hit.has(code); // true for one step after the key goes down
+addEventListener('keydown', e => {
+  startAudio();
+  if (!e.repeat) { down.add(e.code); hit.add(e.code); }
+  if (e.code === 'Space' || e.code.startsWith('Arrow') || e.code === 'Tab') e.preventDefault();
+});
+addEventListener('keyup', e => down.delete(e.code));
+addEventListener('pointerdown', () => startAudio());
+addEventListener('blur', () => down.clear());
+
+// ---- Audio: started on first input, mute on M --------------------------------------------
+let audio = null, muted = false;
+function startAudio() {
+  if (!audio) {
+    try {
+      const ac = window.GAME_AUDIO || new (window.AudioContext || window.webkitAudioContext)(); // a check may inject one
+      const out = ac.createGain(); out.gain.value = muted ? 0 : tune.volume;
+      out.connect(ac.destination); audio = { ac, out };
+      audioInit();
+    } catch (_) { return; }
+  }
+  if (audio.ac.state === 'suspended') audio.ac.resume();
+}
+function setMuted(m) { muted = m; if (audio) audio.out.gain.value = m ? 0 : tune.volume; saveSettings(); }
+addEventListener('tune', () => setMuted(muted)); // the tweak panel (an add-on), when added, moved a value: the volume follows
+function tone(freq, dur, type = 'square', vol = 0.3) { if (audio && !muted) ping(freq, dur, type, vol); }
+
+// ---- Settings kept on this device -----------------------------------------------------------
+const SETTINGS = { calm: false, bright: 1 };
+try { const s = JSON.parse(localStorage.getItem('nullward') || '{}'); if (typeof s.calm === 'boolean') SETTINGS.calm = s.calm; if (s.bright) SETTINGS.bright = s.bright; if (s.muted) muted = true; } catch (_) {}
+function saveSettings() { try { localStorage.setItem('nullward', JSON.stringify({ calm: SETTINGS.calm, bright: SETTINGS.bright, muted })); } catch (_) {} }
+function toggleCalm() {
+  SETTINGS.calm = !SETTINGS.calm; saveSettings();
+  if (typeof toast === 'function' && WORLD) toast(SETTINGS.calm ? CALM_TEXT : 'Calm off');
+  if (scene === 'play' || scene === 'pause') P.pips = Math.min(maxPips(), Math.max(P.pips, SETTINGS.calm ? maxPips() : P.pips));
+  emit({ type: 'calm', on: SETTINGS.calm });
+}
+const CALM_TEXT = 'Calm on: for younger players. More hits, slower critters, longer glides and wall-runs, and a fall puts you back at the edge';
+function cycleBright() { const b = [1, 1.2, 1.4, 1.6]; SETTINGS.bright = b[(b.indexOf(SETTINGS.bright) + 1) % b.length] || 1; saveSettings(); }
+
+// ---- The game ------------------------------------------------------------------------------
+let WORLD = null;
+const GAME = { time: 0, steps: 0, runTime: 0, cranes: 0, lastStone: 0, hitstop: 0, respawnT: 0, respawn: null, fade: 0,
+  glitch: null, nextGlitch: 0, nextFlock: 0, hintT: 0, hintA: 0, hintText: '', atStone: -1, result: null, did: {}, lockLostOk: false };
+const WIND = { s: 0.5, x: 1, z: 0 };
+
+function seedFromAddress() {
+  const h = location.hash.match(/seed=(\d+)/), q = params.get('seed');
+  return Number(h && h[1]) || Number(q) || CONFIG.seed;
+}
+function nextSeed() { return 1 + Math.floor(Math.random() * 999999); } // a new world's number: not gameplay randomness
+/** Make a world from a seed: its data, meshes, critters and cranes. */
+function newWorld(s) {
+  WORLD = generateWorld(s);
+  buildWorldMeshes(WORLD);
+  spawnCritters(WORLD, RENDER.scene);
+  spawnCranes(WORLD, RENDER.scene);
+  buildEncounters(WORLD);
+  RENDER.ringAnchor = { x: WORLD.start.x, z: WORLD.start.z };
+  seed = s;
+  try { if (Number(seedFromAddress()) !== s || !location.hash) history.replaceState(null, '', '#seed=' + s); } catch (_) {}
+  const st = WORLD.stones[0];
+  playerPlace(WORLD.start.x, groundAt(WORLD.start.x, WORLD.start.z, 200).h, WORLD.start.z, WORLD.start.heading);
+  CAM.yaw = WORLD.start.heading; CAM.pitch = -0.2; CAM.target.set(P.pos.x, P.pos.y + 1.25, P.pos.z); CAM.dist = tune.cam_distance;
+  void st;
+}
+function stoneSpot(i) {
+  const s = WORLD.stones[i], a = s.heading;
+  const x = s.x + Math.cos(a) * 2.2 - Math.sin(a) * (s.x === s.x ? 0 : 0), z = s.z + Math.sin(a) * 2.2;
+  return { x, z, y: groundAt(x, z, s.y + 3).h, facing: a };
+}
+/** A fresh run of this world: back to the first stone, everything as it was. */
+function startRun() {
+  reset();
+  resetEncounters();
+  for (const c of CRITTERS) critterReset(c);
+  for (const c of CRANES) { c.found = false; c.pos.copy(c.home); c.vel.set(0, 0, 0); }
+  RENDER.stones.forEach((s, i) => s.glyphMat.color.copy(grey(i === 0 ? 210 : 44)));
+  GAME.gateOpen = false; GAME.runTime = 0; GAME.cranes = 0; GAME.lastStone = 0; GAME.result = null; GAME.respawnT = 0; GAME.fade = 0; GAME.did = {};
+  GAME.nextFlock = GAME.time + 40 + rng() * 50; GAME.nextGlitch = GAME.time + 45 + rng() * 65;
+  P.bestFlow = 0; P.pips = maxPips();
+  playerPlace(WORLD.start.x, groundAt(WORLD.start.x, WORLD.start.z, 200).h, WORLD.start.z, WORLD.start.heading);
+  CAM.yaw = WORLD.start.heading; CAM.pitch = -0.2; CAM.lookIdle = 9;
+  BIRDS.list = []; BIRDS.flock = null;
+  GAME.toast = null; GAME.introT = 2.5;
+  scene = 'play';
+  emit({ type: 'start', seed: WORLD.seed });
+}
+/** Fade out, put the wanderer somewhere, fade in. */
+function respawnAt(spot, resetAhead) {
+  if (GAME.respawnT > 0) return;
+  GAME.respawnT = 0.8; GAME.respawn = { spot, resetAhead, done: false };
+}
+function respawnStep(dt) {
+  GAME.respawnT -= dt; const t = 0.8 - GAME.respawnT;
+  GAME.fade = t < 0.4 ? t / 0.4 : Math.max(0, GAME.respawnT / 0.4);
+  if (t >= 0.4 && !GAME.respawn.done) {
+    const s = GAME.respawn.spot; GAME.respawn.done = true;
+    playerPlace(s.x, s.y, s.z, s.facing); P.pips = maxPips();
+    CAM.yaw = s.facing; CAM.lookIdle = 9; CAM.target.set(s.x, s.y + 1.25, s.z);
+    if (GAME.respawn.resetAhead) { const st = WORLD.stones[GAME.lastStone]; for (const c of CRITTERS) if (c.s >= st.s - 10 && !(c.kind === 'sentinel' && !c.alive && GAME.gateOpen)) critterReset(c); }
+  }
+  if (GAME.respawnT <= 0) { GAME.respawnT = 0; GAME.fade = 0; }
+}
+function gameLose() { emit({ type: 'lose' }); respawnAt(stoneSpot(GAME.lastStone), true); }
+function gameFall() {
+  if (GAME.respawnT > 0) return;
+  sfx('fall'); flowBreak(); emit({ type: 'fall' });
+  if (SETTINGS.calm) respawnAt({ x: P.lastGround.x, y: P.lastGround.y, z: P.lastGround.z, facing: P.facing }, false);
+  else respawnAt(stoneSpot(GAME.lastStone), true);
+}
+function gameCalmCatch(spot) { if (GAME.respawnT <= 0) respawnAt({ x: spot.x, y: spot.y, z: spot.z, facing: P.facing }, false); }
+
+/** The rest of the world's step: stones, cranes, the goal, the pacing, the hints. */
+function worldStep(dt) {
+  // standing stones
+  GAME.atStone = -1;
+  WORLD.stones.forEach((s, i) => {
+    const d = Math.hypot(P.pos.x - s.x, P.pos.z - s.z);
+    if (d < 4.5) GAME.atStone = i;
+    if (d < 2.8 && Math.abs(P.pos.y - s.y) < 3 && i !== GAME.lastStone && s.s > WORLD.stones[GAME.lastStone].s - 1) {
+      GAME.lastStone = i; P.pips = maxPips(); sfx('stone');
+      RENDER.stones.forEach((r, k) => r.glyphMat.color.copy(grey(k === i ? 210 : k < i ? 90 : 44)));
+      emit({ type: 'stone', i });
+    }
+  });
+  if (INPUT.calmPressed && GAME.atStone >= 0) toggleCalm();
+  cranesStep(dt);
+  // the goal: standing on the spire's crown
+  if (P.grounded && P.groundBox && P.groundBox.crown && !GAME.result) {
+    const par = Math.round((WORLD.length / (tune.run_speed * 0.75) + 45) / 5) * 5;
+    GAME.result = { time: GAME.runTime, flow: P.bestFlow, cranes: GAME.cranes, total: WORLD.cranes.length, par };
+    state.gained = `the spire in ${fmtTime(GAME.runTime)}`;
+    sfx('goal'); emit({ type: 'goal', time: GAME.runTime }); birdBurst(P.pos.x, P.pos.y + 2, P.pos.z, 40);
+    scene = 'results'; GAME.lockLostOk = true; if (document.exitPointerLock) document.exitPointerLock();
+  }
+  // wind that wanders: visual-interest's two slow signals
+  const micro = 1 + 0.2 * noise1(GAME.time * 0.02, 11), mn = noise1(GAME.time * 0.005, 23);
+  const macro = mn < -0.15 ? 1 - 0.98 * smooth(0, 1, Math.min(1, (-0.15 - mn) / 0.5)) : 1;
+  WIND.s = clamp(0.55 * micro * macro + 0.2 * noise1(GAME.time * 0.17, 31), 0, 1.2);
+  const wa = noise1(GAME.time * 0.01, 41) * Math.PI; WIND.x = Math.cos(wa) * WIND.s; WIND.z = Math.sin(wa) * WIND.s;
+  // rare events
+  if (GAME.time > GAME.nextFlock) { startFlock(rng); GAME.nextFlock = GAME.time + tune.flock_min + rng() * (tune.flock_max - tune.flock_min); }
+  if (GAME.time > GAME.nextGlitch) {
+    GAME.glitch = { t: 0, dur: 0.3 + rng() * 0.4, y: 0.1 + rng() * 0.8, h: 0.008 + rng() * 0.03, shift: (0.006 + rng() * 0.02) * (rng() < 0.5 ? -1 : 1) };
+    GAME.nextGlitch = GAME.time + tune.glitch_min + rng() * (tune.glitch_max - tune.glitch_min); sfx('glitch');
+  }
+  if (GAME.glitch) { GAME.glitch.t += dt; if (GAME.glitch.t > GAME.glitch.dur) GAME.glitch = null; }
+  // teaching: a short line for the piece you are on, until you have done its move
+  if (P.floating) GAME.did.float = true;
+  const q = WORLD.nearSpine(P.pos.x, P.pos.z), pc = q.s >= 0 ? WORLD.pieces.find(p => q.s >= p.s0 - 16 && q.s <= p.s1) : null;
+  let h = '';
+  if (pc) {
+    const t = pc.type;
+    if ((t === 'start' || t === 'field') && GAME.runTime < 9) h = `${K('move')} to run: speed builds`;
+    else if (t === 'vault' && !GAME.did.vault) h = 'run into a low ledge to vault it';
+    else if (t === 'gap' && !GAME.did.jump) h = `${K('jump')} to jump`;
+    else if (t === 'gapfloat' && !GAME.did.float) h = `hold ${K('jump')} to float`;
+    else if (t === 'wallgap' && pc.tutorial && !GAME.did.wallrun) h = 'jump along the wall to run on it';
+    else if (t === 'sleepy' && !GAME.did.cut) h = `${K('strike')}: the blade carries you`;
+    else if (t === 'floatergap' && (GAME.did.cut ? 0 : 1)) h = `${K('strike')} from one to the next`;
+  }
+  const g0 = WORLD.gates[0];
+  if (g0 && !g0.box.off && Math.hypot(P.pos.x - g0.x, P.pos.z - g0.z) < 30) h = ENC.awake ? `${K('strike')} the guardian when its core shows` : `the gate is sealed: light the ${ENC.shrines.length} shrines (${ENC.litCount} lit)`;
+  if (GAME.atStone >= 0) h = '';
+  if (h) GAME.hintText = h;
+  GAME.hintA += (h ? 1 : -1) * dt * 2.5; GAME.hintA = clamp(GAME.hintA, 0, 1);
+  // the ghost of the scarf after a stall at the first wall-run gap
+  const hz = WORLD.hints[0];
+  if (hz) {
+    const inZone = Math.hypot(P.pos.x - hz.zone.x, P.pos.z - hz.zone.z) < hz.r && !GAME.did.wallrun;
+    GAME.hintT = inZone ? GAME.hintT + dt : 0;
+  }
+}
+
+// ---- Scenes: title, play, pause, results, figures -------------------------------------------
+let scene, state;
+function reset() {
+  seed = Number(seedFromAddress()) || CONFIG.seed;
+  // state.gained: what this run gained or learned, the high the ending shows.
+  state = { t: 0, score: 0, gained: '', pips: 0, cranes: 0, flow: 0, speed: 0, x: 0, y: 0, z: 0, stone: 0 };
+}
+function syncState() {
+  state.t = GAME.runTime; state.score = GAME.cranes; state.pips = P.pips; state.cranes = GAME.cranes; state.flow = P.flow;
+  state.speed = Math.hypot(P.vel.x, P.vel.z); state.x = P.pos.x; state.y = P.pos.y; state.z = P.pos.z; state.stone = GAME.lastStone;
+}
+let lastDraw = 0;
+function frameDt() { const n = performance.now(), d = Math.min(0.1, (n - (lastDraw || n)) / 1000); lastDraw = n; return d; }
+function drawWorld(dt) {
+  const pos = new THREE.Vector3().lerpVectors(P.prev, P.pos, ALPHA);
+  animateWanderer(dt, pos); updateScarf(dt, WIND); updateTrail(dt, pos);
+  animateCritters(dt, ALPHA); drawBirds(); drawCranes(); drawEncounters(dt);
+  if (RENDER.hint) RENDER.hint.material.opacity = clamp((GAME.hintT - 6) * 0.5, 0, 0.55) * (0.6 + 0.4 * Math.sin(GAME.time * 3));
+  updateCamera(dt, pos, Math.hypot(P.vel.x, P.vel.z));
+  renderWorld(GAME.time, dt);
+  audioFrame(Math.hypot(P.vel.x, P.vel.z));
+}
+const scenes = {
+  figures: {
+    update(dt) { state.t += dt; GAME.time += dt; },
+    draw() {
+      if (!FIG.scene) buildFigures();
+      clear();
+      for (const it of FIG.items) if (it.kind !== 'wanderer') { const c = it.c; c.t = GAME.time; }
+      const fw = FIG.items[0];
+      if (fw && params.get('fig') === 'glide') { // the wanderer held mid-glide, for a look at the kite-wing
+        P.floating = true; P.grounded = false; P.vel.set(0, -2, 0); P.facing = Math.PI / 2;
+        for (let k = 0; k < 8; k++) animateWanderer(1 / 30, fw.obj.position.clone().setY(0.6));
+      }
+      if (fw) { fw.obj.updateMatrixWorld(true); for (let k = 0; k < 3; k++) updateScarf(1 / 30, WIND); }
+      renderFigures();
+      hudFigures(FIG.items);
+    },
+  },
+  title: {
+    update(dt) {
+      GAME.time += dt; GAME.steps++;
+      readInput(dt);
+      if (pressed('Enter') || pressed('Space') || pressed('NumpadEnter') || INPUT.jumpPressed || INPUT.pausePressed) { startRun(); return; }
+      if (pressed('KeyC')) toggleCalm();
+      if (pressed('KeyB')) cycleBright();
+      if (pressed('KeyQ')) cycleTier();
+      if (pressed('KeyN')) newWorld(nextSeed());
+      // the title drifts slowly over the start, as visual-interest drifts
+      CAM.yaw = WORLD.start.heading + Math.sin(GAME.time * 0.02) * 0.5; CAM.pitch = -0.08 + Math.sin(GAME.time * 0.013) * 0.04; CAM.lookIdle = 0;
+      worldStepIdle(dt);
+    },
+    draw() {
+      const dt = frameDt(); UI_BUTTONS = [];
+      drawWorld(dt); clear(); hudTitle();
+    },
+  },
+  play: {
+    update(dt) {
+      GAME.time += dt; GAME.steps++;
+      readInput(dt);
+      if (INPUT.pausePressed) { scene = 'pause'; GAME.lockLostOk = true; if (document.exitPointerLock && document.pointerLockElement) document.exitPointerLock(); return; }
+      if (pressed('KeyR')) respawnAt(stoneSpot(GAME.lastStone), true);
+      if (GAME.respawnT > 0) { respawnStep(dt); INPUT.wish.set(0, 0, 0); INPUT.jumpPressed = INPUT.strikePressed = INPUT.jumpHeld = false; }
+      if (GAME.hitstop > 0) { GAME.hitstop -= dt; if (INPUT.jumpPressed) P.jumpBuf = tune.jump_buffer; birdsStep(dt); return; }
+      GAME.runTime += dt;
+      playerStep(dt); crittersStep(dt); birdsStep(dt); worldStep(dt); encountersStep(dt);
+      if (GAME.toast) { GAME.toast.t += dt; if (GAME.toast.t > 4.5) GAME.toast = null; }
+      if (GAME.introT > 0 && (GAME.introT -= dt) <= 0) toast('three pale threads rise from shrines in the open land: light them to open the spire');
+      syncState();
+    },
+    draw() {
+      const dt = frameDt(); UI_BUTTONS = [];
+      drawWorld(dt); clear(); hudPlay();
+    },
+  },
+  pause: {
+    update() {
+      readInput(STEP);
+      if (pressed('KeyP') || pressed('Escape') || INPUT.pausePressed) scene = 'play';
+      if (pressed('KeyC')) toggleCalm();
+      if (pressed('KeyB')) cycleBright();
+      if (pressed('KeyQ')) cycleTier();
+      if (pressed('KeyR')) { scene = 'play'; respawnAt(stoneSpot(GAME.lastStone), true); }
+      if (pressed('KeyN')) { newWorld(nextSeed()); startRun(); }
+    },
+    draw() { const dt = frameDt(); UI_BUTTONS = []; drawWorld(0 * dt); clear(); hudPause(); },
+  },
+  results: {
+    update(dt) {
+      GAME.time += dt; GAME.steps++; readInput(dt); birdsStep(dt); cranesStep(dt);
+      if (pressed('Enter') || pressed('NumpadEnter') || INPUT.jumpPressed) startRun();
+      if (pressed('KeyN')) { newWorld(nextSeed()); startRun(); }
+      CAM.yaw += dt * 0.05; CAM.lookIdle = 0;
+    },
+    draw() { const dt = frameDt(); UI_BUTTONS = []; drawWorld(dt); clear(); hudResults(); },
+  },
+};
+/** The title's world: wind, birds and pacing run; nobody plays. */
+function worldStepIdle(dt) {
+  const micro = 1 + 0.2 * noise1(GAME.time * 0.02, 11); WIND.s = clamp(0.5 * micro, 0, 1.2);
+  if (GAME.time > GAME.nextFlock) { startFlock(rng); GAME.nextFlock = GAME.time + 20 + rng() * 40; }
+  birdsStep(dt);
+}
+
+// ---- The figures scene: every critter and the wanderer side by side --------------------------
+const FIG = { scene: null, camera: null, items: [] };
+function buildFigures() {
+  const S = new THREE.Scene(); S.background = grey(64);
+  const ground = new THREE.Mesh(new THREE.PlaneGeometry(60, 30), new THREE.MeshLambertMaterial({ color: grey(70) })); ground.rotation.x = -Math.PI / 2; ground.receiveShadow = true; S.add(ground);
+  S.add(new THREE.HemisphereLight(grey(200), grey(60), 0.9)); const key = new THREE.DirectionalLight(0xffffff, 1.2); key.position.set(-4, 8, 6); S.add(key);
+  const row = [
+    { kind: 'wanderer', label: 'the wanderer', labelY: -0.6 },
+    { kind: 'lost', label: 'lost spirit', labelY: -0.7 },
+    { kind: 'sleepy', label: 'sleepy critter', labelY: -0.95 },
+    { kind: 'crawler', label: 'crawler', labelY: -0.9 },
+    { kind: 'floater', label: 'floater', labelY: -2.3 },
+    { kind: 'sentinel', label: 'sentinel', labelY: -0.9 },
+  ];
+  row.forEach((it, i) => {
+    let obj;
+    if (it.kind === 'wanderer') { obj = MODEL.root; P.vel.set(0, 0, 0); P.grounded = true; obj.parent && obj.parent.remove(obj); S.add(obj); obj.position.set(0, 0, 0); obj.rotation.y = 0.3; obj.scale.setScalar(1); SCARF.mesh.parent && SCARF.mesh.parent.remove(SCARF.mesh); S.add(SCARF.mesh); }
+    else if (it.kind === 'lost') { obj = lostSpiritMesh().grp; obj.scale.setScalar(1.6); obj.position.y = 0.27; S.add(obj); it.c = { t: 0 }; }
+    else { const m = buildCritterMesh(it.kind); obj = m.group; S.add(obj); it.c = { t: 0 }; if (it.kind === 'floater') obj.position.y = 1.5; if (it.kind === 'sleepy') obj.position.y = 0.3; obj.rotation.y = 0.35; if (it.kind === 'sentinel') { m.parts.arm.rotation.y = -0.6; } }
+    const x = -8.4 + i * 3.3; obj.position.x = x; if (it.kind === 'sentinel') obj.position.x = x + 0.8;
+    it.obj = obj; FIG.items.push(it);
+  });
+  FIG.scene = S;
+  FIG.camera = new THREE.PerspectiveCamera(44, innerWidth / innerHeight, 0.1, 200);
+  FIG.camera.position.set(0, 2.6, 15); FIG.camera.lookAt(0, 1.3, 0);
+  const close = params.get('fig'), wx = FIG.items[0].obj.position.x;
+  if (close === 'hero') { FIG.camera.position.set(wx + 0.75, 1.0, 2.0); FIG.camera.lookAt(wx, 0.62, 0); FIG.items = FIG.items.slice(0, 1); }
+  if (close === 'glide') { FIG.camera.position.set(wx - 0.9, 2.1, -2.4); FIG.camera.lookAt(wx, 1.0, 0); FIG.items = FIG.items.slice(0, 1); }
+  if (close === 'back') { FIG.camera.position.set(wx - 1.1, 1.3, -1.9); FIG.camera.lookAt(wx, 0.62, 0); FIG.items = FIG.items.slice(0, 1); }
+}
+function renderFigures() {
+  FIG.camera.aspect = innerWidth / innerHeight; FIG.camera.updateProjectionMatrix();
+  renderThrough(FIG.scene, FIG.camera);
+}
+
+// ---- Loop: fixed step, frame time clamped ---------------------------------------------
+function step() {
+  if (pressed('KeyM')) { setMuted(!muted); hit.delete('KeyM'); }
+  scenes[scene].update(STEP); hit.clear();
+}
+let last, acc = 0, ALPHA = 1; // ALPHA: how far the frame is between the last two steps
+function tick() {
+  const now = clock.now();
+  const ft = (now - last) * 1000;
+  acc += Math.min(now - last, 0.25); last = now; // a stall never fast-forwards the game
+  while (acc >= STEP) { step(); acc -= STEP; }
+  ALPHA = acc / STEP; // draw between steps, so the view never judders
+  drawFrame();
+  adaptScale(ft);
+}
+function drawFrame() { scenes[scene].draw(); }
+function frame() { tick(); requestAnimationFrame(frame); }
+// A headless browser on a time budget runs timers but almost no animation frames: a timer
+// ticks when no frame has come for 100 ms on a visible page; a hidden tab stays paused.
+function timer() { if (document.visibilityState === 'visible' && clock.now() - last > 0.1) tick(); }
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') { if (scene === 'play') scene = 'pause'; if (audio && audio.ac.state === 'running') audio.ac.suspend(); }
+  else if (audio) audio.ac.resume();
+});
+
+// ---- What a check can read and drive (?manual=1 stops the loop; players never see it) ----
+window.game = {
+  get scene() { return scene; },
+  get state() { return state; },
+  press(code) { hit.add(code); },
+  hold(code, on) { on ? down.add(code) : down.delete(code); },
+  get events() { return events; }, // the loop steps; a check empties it
+  step(n = 1, draw = true, alpha = 1) {
+    for (let i = 0; i < n; i++) step();
+    if (draw) { ALPHA = alpha; drawFrame(); }
+  },
+};
+
+reset();
+initRender();
+const MODEL_ROOT = buildWanderer(); RENDER.scene.add(MODEL_ROOT);
+RENDER.scene.add(buildScarf()); RENDER.scene.add(buildTrail());
+buildBirds(RENDER.scene);
+initInput();
+newWorld(Number(seedFromAddress()) || CONFIG.seed);
+GAME.nextFlock = 25; GAME.nextGlitch = 60;
+scene = ['title', 'play', 'figures'].includes(params.get('scene')) ? params.get('scene') : 'title';
+if (scene === 'play') startRun();
+last = clock.now();
+if (params.get('manual') === '1') drawFrame();
+else { requestAnimationFrame(frame); setInterval(timer, 50); }
+</script>
+</body>
+</html>
